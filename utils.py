@@ -13,9 +13,10 @@ from langchain_core.messages import (
     AIMessage,
     BaseMessage
 )
-from langchain_core.chat_history import BaseChatMessageHistory
+from langchain_classic.memory import ConversationBufferMemory  # type: ignore
+from langchain_classic.chains import ConversationChain  # type: ignore
+from langchain_core.prompts import PromptTemplate
 from langchain_core.runnables import RunnableConfig
-from pydantic import BaseModel, Field
 
 # Disable SSL warnings for fallback method
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -29,26 +30,6 @@ USER_AGENT = "streamlit-weather-app (contact: weather@example.com)"
 load_dotenv()
 
 
-class InMemoryChatMessageHistory(BaseChatMessageHistory, BaseModel):
-    """In-memory implementation of chat message history."""
-
-    messages: list[BaseMessage] = Field(default_factory=list)
-
-    def add_messages(self, messages: list[BaseMessage]) -> None:
-        """Add a list of messages to the store."""
-        self.messages.extend(messages)
-
-    def clear(self) -> None:
-        """Clear all messages from the store."""
-        self.messages = []
-
-    def add_user_message(self, message: str) -> None:
-        """Add a user message to the store."""
-        self.messages.append(HumanMessage(content=message))
-
-    def add_ai_message(self, message: str) -> None:
-        """Add an AI message to the store."""
-        self.messages.append(AIMessage(content=message))
 
 
 def geocode_zip_code(zip_code: str) -> Optional[tuple[float, float, str]]:
@@ -454,27 +435,77 @@ def generate_forecast_summary(
         )
 
 
-def get_or_create_chat_history(
+def get_or_create_conversation_memory(
         conversation_id: str
-) -> InMemoryChatMessageHistory:
+) -> ConversationBufferMemory:
     """
-    Get or create a chat message history for a conversation ID.
+    Get or create a ConversationBufferMemory for a conversation ID.
+
+    Uses ConversationBufferMemory to store conversation history persistently
+    across multiple interactions.
 
     Args:
         conversation_id: Unique identifier for the conversation
 
     Returns:
-        InMemoryChatMessageHistory instance for the conversation
+        ConversationBufferMemory instance for the conversation
     """
-    if "chat_histories" not in st.session_state:
-        st.session_state.chat_histories = {}
+    if "conversation_memories" not in st.session_state:
+        st.session_state.conversation_memories = {}
 
-    if conversation_id not in st.session_state.chat_histories:
-        st.session_state.chat_histories[conversation_id] = (
-            InMemoryChatMessageHistory()
+    if conversation_id not in st.session_state.conversation_memories:
+        # Create ConversationBufferMemory to store conversation history
+        # return_messages=True returns messages as a list of message objects
+        # which works well with chat models
+        memory = ConversationBufferMemory(
+            return_messages=True,
+            memory_key="history"
         )
+        st.session_state.conversation_memories[conversation_id] = memory
 
-    return st.session_state.chat_histories[conversation_id]
+    return st.session_state.conversation_memories[conversation_id]
+
+
+def get_or_create_conversation_chain(
+        conversation_id: str,
+        model: ChatGoogleGenerativeAI,
+        forecast_data: Dict[str, Any],
+        town_name: str
+) -> Optional[ConversationChain]:
+    """
+    Get or create a ConversationChain with ConversationBufferMemory
+    for a conversation ID.
+
+    Note: ConversationChain is designed for LLMs, not chat models.
+    This function creates a chain structure but the actual invocation
+    is handled by answer_weather_question which works with chat models.
+
+    Args:
+        conversation_id: Unique identifier for the conversation
+        model: Initialized Gemini chat model (stored for reference)
+        forecast_data: Dictionary containing forecast data from NWS API
+        town_name: Name of the town/city
+
+    Returns:
+        ConversationChain instance or None if not applicable
+    """
+    # Get the memory for this conversation
+    memory = get_or_create_conversation_memory(conversation_id)
+    
+    # Store chain metadata in session state for reference
+    if "conversation_chain_metadata" not in st.session_state:
+        st.session_state.conversation_chain_metadata = {}
+    
+    st.session_state.conversation_chain_metadata[conversation_id] = {
+        "memory": memory,
+        "model": model,
+        "forecast_data": forecast_data,
+        "town_name": town_name
+    }
+    
+    # Return None as ConversationChain doesn't work directly with chat models
+    # The memory is used directly in answer_weather_question
+    return None
 
 
 def answer_weather_question(
@@ -487,7 +518,7 @@ def answer_weather_question(
     """
     Answer a weather-related question using Gemini with forecast context.
 
-    Uses LangChain's chat message history to persist conversation context
+    Uses LangChain's ConversationBufferMemory to persist conversation context
     between calls using a conversation ID.
 
     Args:
@@ -501,9 +532,9 @@ def answer_weather_question(
         Answer to the question
     """
     try:
-        # Get or create chat history for this conversation
-        chat_history = get_or_create_chat_history(conversation_id)
-
+        # Get or create ConversationBufferMemory for this conversation
+        memory = get_or_create_conversation_memory(conversation_id)
+        
         formatted_forecast = format_forecast_data(forecast_data)
 
         # Build system message with forecast context
@@ -515,12 +546,17 @@ def answer_weather_question(
             f"{formatted_forecast}"
         )
 
-        # Get previous messages from history
-        previous_messages = chat_history.messages
+        # Get conversation history from memory
+        history_dict = memory.load_memory_variables({})
+        history_messages = history_dict.get("history", [])
 
         # Build message list: system message, history, and new question
         messages = [SystemMessage(content=system_msg)]
-        messages.extend(previous_messages)
+        
+        # Add previous conversation history
+        if history_messages:
+            messages.extend(history_messages)
+
         messages.append(HumanMessage(content=question))
 
         # Create config with conversation context and metadata
@@ -533,7 +569,7 @@ def answer_weather_question(
             }
         )
         
-        # Invoke model with full conversation context and config
+        # Invoke model with conversation context
         response = model.invoke(
             messages,
             config=config
@@ -551,9 +587,11 @@ def answer_weather_question(
         else:
             answer = str(response)
 
-        # Add question and answer to chat history
-        chat_history.add_user_message(question)
-        chat_history.add_ai_message(answer)
+        # Save conversation to memory using ConversationBufferMemory
+        memory.save_context(
+            {"input": question},
+            {"output": answer}
+        )
 
         return answer
     except Exception as e:

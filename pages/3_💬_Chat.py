@@ -2,7 +2,11 @@
 import streamlit as st
 import traceback
 import uuid
-from utils import answer_weather_question, get_or_create_chat_history, init_gemini_model
+from utils import (
+    answer_weather_question,
+    get_or_create_conversation_memory,
+    init_gemini_model
+)
 from langchain_core.messages import HumanMessage, AIMessage
 
 # Initialize session state if not already initialized
@@ -49,11 +53,13 @@ else:
     town_name = st.session_state.current_town_name or "the location"
     st.info(f"📍 **Location:** {town_name}")
 
-    # Get chat history for this conversation
-    chat_history = get_or_create_chat_history(
+    # Get conversation memory for this conversation
+    memory = get_or_create_conversation_memory(
         st.session_state.conversation_id
     )
-    messages = chat_history.messages
+    # Load messages from ConversationBufferMemory
+    history_dict = memory.load_memory_variables({})
+    messages = history_dict.get("history", [])
 
     # Display conversation history
     if messages:
